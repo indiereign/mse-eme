@@ -36,6 +36,7 @@ import java.util.List;
 
 import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.codec.binary.Hex;
+import org.apache.commons.codec.DecoderException;
 import org.cablelabs.clearkey.cryptfile.ClearKeyPSSH;
 import org.cablelabs.cmdline.CmdLine;
 import org.cablelabs.cryptfile.CryptKey;
@@ -48,18 +49,19 @@ import org.cablelabs.playready.cryptfile.PlayReadyPSSH;
 import org.w3c.dom.Document;
 
 public class CryptfileGen {
-    
+
     private static class Usage implements org.cablelabs.cmdline.Usage {
         public void usage() {
             System.out.println("Microsoft PlayReady MP4Box cryptfile generation tool.");
             System.out.println("");
-            System.out.println("usage:  CryptfileGen [OPTIONS] <track_id>:{@<keyid_file>|<key_id>[,<key_id>...]} [<track_id>:{@<keyid_file>|<key_id>[,<key_id>...]}]...");
+            System.out.println("usage:  CryptfileGen [OPTIONS] <track_id>:{@<keyid_file>|<key_id>#<key>[,<key_id>#<key>...]} [<track_id>:{@<keyid_file>|<key_id>[,<key_id>...]}]...");
             System.out.println("");
             System.out.println("\t<track_id> is the track ID from the MP4 file to be encrypted.");
             System.out.println("\tAfter the '<track_id>:', you can specify either a file containing key IDs OR a");
             System.out.println("\tcomma-separated list of key IDs.  Key IDs are always represented in GUID form");
             System.out.println("\t(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx). Multiple key IDs indicate the use of");
-            System.out.println("\trolling keys.");
+            System.out.println("\trolling keys. Encryption keys can be specified by adding # and then adding the ");
+            System.out.println("\tencryption key in hex format (16 bytes).");
             System.out.println("");
             System.out.println("\t\t<keyid_file> is a file that contains a list of key IDs, one key ID per line.");
             System.out.println("");
@@ -94,33 +96,33 @@ public class CryptfileGen {
             System.out.println("\t\tPrint a DASH <ContentProtection> element that can be pasted into the MPD");
         }
     }
-    
+
     private static class Track {
         List<String> keyIDs = new ArrayList<String>();
         int id;
     }
-    
+
     public static void main(String[] args) {
 
         CmdLine cmdline = new CmdLine(new Usage());
-        
+
         // Rolling keys
         int rollingKeySamples = -1;
-        
+
         String outfile = null;
         String url = PlayReadyPSSH.TEST_URL;
         List<Track> tracks = new ArrayList<Track>();
         WRMHeader.Version headerVersion = WRMHeader.Version.V_4000;
-        
+
         // Clearkey
         boolean clearkey = false;
-        
+
         // Print content protection element?
         boolean printCP = false;
-        
+
         // Parse arguments
         for (int i = 0; i < args.length; i++) {
-            
+
             // Parse options
             if (args[i].startsWith("-")) {
                 String[] subopts;
@@ -161,10 +163,10 @@ public class CryptfileGen {
                 else {
                     cmdline.errorExit("Illegal argument: " + args[i]);
                 }
-                
+
                 continue;
             }
-            
+
             // Parse tracks
             String track_desc[] = args[i].split(":");
             if (track_desc.length != 2) {
@@ -173,7 +175,7 @@ public class CryptfileGen {
             try {
                 Track t = new Track();
                 t.id = Integer.parseInt(track_desc[0]);
-                
+
                 // Read key IDs from file
                 if (track_desc[1].startsWith("@")) {
                     String keyfile = track_desc[1].substring(1);
@@ -190,7 +192,7 @@ public class CryptfileGen {
                         t.keyIDs.add(keyID);
                     }
                 }
-                
+
                 tracks.add(t);
             }
             catch (IllegalArgumentException e) {
@@ -203,27 +205,41 @@ public class CryptfileGen {
                 cmdline.errorExit("Error reading from Key ID file: " + e.getMessage());
             }
         }
-        
+
         List<WRMHeader> wrmHeaders = new ArrayList<WRMHeader>();
         List<CryptTrack> cryptTracks = new ArrayList<CryptTrack>();
-        
+        Hex hexDecoder = new Hex();
+
         // Build one CryptTrack for every track and gather a list of all
         // WRMHeaders to put in one PSSH
         for (Track t : tracks) {
             List<CryptKey> cryptKeys = new ArrayList<CryptKey>();
             for (String keyID : t.keyIDs) {
-                PlayReadyKeyPair prKey = new PlayReadyKeyPair(keyID);
+                PlayReadyKeyPair prKey = null;
+                try {
+                    int hashIndex = keyID.indexOf("#");
+                    if (hashIndex == -1){
+                        prKey = new PlayReadyKeyPair(keyID);
+                    }
+                    else {
+                        String key = keyID.substring(0,hashIndex);
+                        byte[] encryptionKey = (byte[])hexDecoder.decode(keyID.substring(hashIndex + 1 ,keyID.length()));
+                        prKey = new PlayReadyKeyPair(key, encryptionKey, null);
+                    }
+                }catch(DecoderException e){
+                    cmdline.errorExit("Error reading encrypted key: " + e.getMessage());
+                }
+
                 wrmHeaders.add(new WRMHeader(headerVersion, prKey, url));
-                
                 cryptKeys.add(new CryptKey(prKey));
             }
             cryptTracks.add(new CryptTrack(t.id, 8, null, cryptKeys, rollingKeySamples));
         }
-        
+
         // Create our PSSH
         List<DRMInfoPSSH> psshList = new ArrayList<DRMInfoPSSH>();
         psshList.add(new PlayReadyPSSH(wrmHeaders, PlayReadyPSSH.ContentProtectionType.CENC));
-        
+
         // Add clearkey PSSH if requested
         if (clearkey) {
             int keyCount = 0;
@@ -245,7 +261,7 @@ public class CryptfileGen {
             System.out.println("");
             psshList.add(new ClearKeyPSSH(keyIDs));
         }
-        
+
         // Print ContentProtection element
         if (printCP) {
             System.out.println("############# Content Protection Element #############");
@@ -262,11 +278,11 @@ public class CryptfileGen {
             }
             System.out.println("######################################################");
         }
-        
+
         // Create the cryptfile builder
         CryptfileBuilder cfBuilder = new CryptfileBuilder(CryptfileBuilder.ProtectionScheme.AES_CTR,
                                                           cryptTracks, psshList);
-        
+
         // Write the output
         Document d = cfBuilder.buildCryptfile();
         CryptfileBuilder.writeXML(d, System.out);
